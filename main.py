@@ -300,9 +300,11 @@ def get_opponent_stats(game_state: typing.Dict) -> typing.Dict:
 def is_head_to_head_safe(pos: typing.Dict, my_length: int, opponent_heads: typing.List) -> bool:
     """Check if position is safe from head-to-head collisions"""
     for opponent in opponent_heads:
-        if manhattan_distance(pos, opponent["pos"]) <= 2:
-            if opponent["length"] >= my_length:
-                return False
+        dist = manhattan_distance(pos, opponent["pos"])
+        # Only avoid if we're adjacent (distance 1) and opponent is same size or larger
+        # This is where actual head-to-head collision can happen next turn
+        if dist == 1 and opponent["length"] >= my_length:
+            return False
     return True
 
 
@@ -311,28 +313,103 @@ def get_all_snake_positions(game_state: typing.Dict) -> set:
     positions = set()
 
     for snake in game_state["board"]["snakes"]:
-        body = snake["body"]
+        body = snake.get("body", [])
 
         if len(body) == 0:
             continue
-
-        # Snake just ate if the last two body segments are at the same position
-        # This happens when the tail duplicated on the previous turn
-        snake_just_ate = len(body) > 1 and body[-1]["x"] == body[-2]["x"] and body[-1]["y"] == body[-2]["y"]
 
         for i, segment in enumerate(body):
             # Skip head (it will move to a new position) - index 0
             if i == 0:
                 continue
 
-            # Skip tail UNLESS snake just ate (then tail stays) - last index
-            if i == len(body) - 1 and not snake_just_ate:
-                continue
-
-            # Add this body segment as an obstacle
-            positions.add((segment["x"], segment["y"]))
+            # Include all body segments including tail
+            # Conservative approach: assume tail might not move (snake could eat)
+            # Better to avoid a position that might be safe than collide
+            pos_tuple = (segment["x"], segment["y"])
+            positions.add(pos_tuple)
 
     return positions
+
+
+def predict_opponent_moves(opponent_head: typing.Dict, opponent_length: int, game_state: typing.Dict, snake_positions: set) -> typing.Dict:
+    """Predict where opponent might move and score their options"""
+    board_width = game_state["board"]["width"]
+    board_height = game_state["board"]["height"]
+
+    opponent_moves = {}
+    directions = ["up", "down", "left", "right"]
+
+    for direction in directions:
+        next_pos = get_next_position(opponent_head, direction)
+        next_pos_tuple = (next_pos["x"], next_pos["y"])
+
+        # Same safety checks opponent would use
+        if is_out_of_bounds(next_pos, board_width, board_height):
+            continue
+        if next_pos_tuple in snake_positions:
+            continue
+
+        # Score based on space they'd have
+        spaces = flood_fill(next_pos, game_state, snake_positions)
+        opponent_moves[direction] = {
+            "pos": next_pos,
+            "spaces": spaces
+        }
+
+    return opponent_moves
+
+
+def has_kill_move(my_head: typing.Dict, my_length: int, opponent: typing.Dict, game_state: typing.Dict, snake_positions: set) -> typing.Optional[str]:
+    """Check if we can force opponent into zero safe moves - winning move detection"""
+    board_width = game_state["board"]["width"]
+    board_height = game_state["board"]["height"]
+    directions = ["up", "down", "left", "right"]
+
+    for my_dir in directions:
+        my_next = get_next_position(my_head, my_dir)
+        my_next_tuple = (my_next["x"], my_next["y"])
+
+        # Skip if our move is invalid
+        if is_out_of_bounds(my_next, board_width, board_height):
+            continue
+        if my_next_tuple in snake_positions:
+            continue
+
+        # Simulate our move - add our new position
+        new_positions = snake_positions.copy()
+        new_positions.add(my_next_tuple)
+
+        # Check if opponent has ANY safe moves left
+        opponent_safe_moves = 0
+        for opp_dir in directions:
+            opp_next = get_next_position(opponent["pos"], opp_dir)
+            opp_next_tuple = (opp_next["x"], opp_next["y"])
+
+            # Check if out of bounds
+            if is_out_of_bounds(opp_next, board_width, board_height):
+                continue
+
+            # Check if hits a snake body (excluding our new head position)
+            if opp_next_tuple in snake_positions:
+                continue
+
+            # Check for head-to-head collision with our new position
+            if opp_next_tuple == my_next_tuple:
+                # Only safe for opponent if they're longer or equal (they win/tie)
+                if opponent["length"] >= my_length:
+                    opponent_safe_moves += 1
+                continue
+
+            # Check if they'd have enough space after this move
+            opp_spaces = flood_fill(opp_next, game_state, new_positions)
+            if opp_spaces >= opponent["length"]:
+                opponent_safe_moves += 1
+
+        if opponent_safe_moves == 0:
+            return my_dir  # WINNING MOVE!
+
+    return None
 
 
 def move(game_state: typing.Dict) -> typing.Dict:
@@ -352,97 +429,52 @@ def move(game_state: typing.Dict) -> typing.Dict:
     # Get all snake body positions that will still be there next turn
     snake_positions = get_all_snake_positions(game_state)
 
-    my_body = [(seg["x"], seg["y"]) for seg in game_state["you"]["body"]]
     length_target = opponent_stats['max_length'] + 2
     need_length = my_length < length_target
 
-    # Debug: log all snake bodies
-    print(f"  Total obstacle positions: {len(snake_positions)}")
-    print(f"  Obstacle positions set: {sorted(list(snake_positions))[:20]}...")  # Show first 20
-    for snake in game_state["board"]["snakes"]:
-        snake_id = snake.get("id", "unknown")
-        snake_name = snake.get("name", snake_id[:8] if snake_id else "unknown")
-        is_me = snake_id == game_state["you"].get("id", "")
-        body_positions = [(seg["x"], seg["y"]) for seg in snake.get("body", [])]
-        print(f"    {'MY' if is_me else 'OPP'} {snake_name}: length {len(snake.get('body', []))}, body {body_positions}")
-
-    # Calculate current Voronoi territories
+    # Calculate Voronoi territories
     my_id = game_state["you"].get("id", "")
     voronoi_territories = calculate_voronoi(game_state, snake_positions)
     my_territory = voronoi_territories.get(my_id, 0)
 
-    # Calculate our territory share
-    total_territory = sum(voronoi_territories.values())
-    my_territory_pct = (my_territory / total_territory * 100) if total_territory > 0 else 0
-
-    print(f"  My length: {my_length}, Target: {length_target}, Max opponent: {opponent_stats['max_length']}, Avg: {opponent_stats['avg_length']:.1f}")
-    print(f"  Phase: {game_phase}, Health: {my_health}, Need length: {need_length}")
-    print(f"  My territory: {my_territory} cells ({my_territory_pct:.1f}%)")
-
-    # Show opponent territories
-    for snake in game_state["board"]["snakes"]:
-        snake_id = snake.get("id", "")
-        if snake_id and snake_id != my_id:
-            opp_territory = voronoi_territories.get(snake_id, 0)
-            opp_pct = (opp_territory / total_territory * 100) if total_territory > 0 else 0
-            snake_name = snake.get("name", snake_id[:10])
-            print(f"    Opponent {snake_name[:10]}: {opp_territory} cells ({opp_pct:.1f}%), length {len(snake.get('body', []))}")
-    if len(food) > 0:
-        # Find closest food by actual path distance
-        food_with_dist = []
-        for f in food:
-            astar_dist = astar_distance(my_head, f, game_state, snake_positions)
-            if astar_dist is not None:
-                food_with_dist.append((f, astar_dist))
-
-        if food_with_dist:
-            closest_food, closest_dist = min(food_with_dist, key=lambda x: x[1])
-            print(f"  Closest food at ({closest_food['x']}, {closest_food['y']}), A* distance: {closest_dist}")
+    # 1v1 KILL MOVE DETECTION - highest priority
+    if game_phase == "1v1" and len(opponent_heads) > 0:
+        opponent = opponent_heads[0]
+        kill_move = has_kill_move(my_head, my_length, opponent, game_state, snake_positions)
+        if kill_move:
+            print(f"  KILL MOVE DETECTED: {kill_move}")
+            return {"move": kill_move}
 
     directions = ["up", "down", "left", "right"]
     move_scores = {}
 
-    # Prevent reversing direction into neck
     my_neck = game_state["you"]["body"][1] if len(game_state["you"]["body"]) > 1 else None
+    opponents_small = opponent_stats['max_length'] <= 6
 
     for direction in directions:
         next_pos = get_next_position(my_head, direction)
+        next_pos_tuple = (next_pos["x"], next_pos["y"])
         score = 0
 
         # SURVIVAL CHECKS - immediate disqualification
 
         # Check reversing into neck
-        if my_neck is not None:
-            if next_pos["x"] == my_neck["x"] and next_pos["y"] == my_neck["y"]:
-                print(f"  {direction}: REVERSE INTO NECK at ({next_pos['x']}, {next_pos['y']})")
-                move_scores[direction] = -10000
-                continue
+        if my_neck and next_pos["x"] == my_neck["x"] and next_pos["y"] == my_neck["y"]:
+            move_scores[direction] = -10000
+            continue
 
         # Check walls
         if is_out_of_bounds(next_pos, board_width, board_height):
-            print(f"  {direction}: OUT OF BOUNDS ({next_pos['x']}, {next_pos['y']}) board: {board_width}x{board_height}")
             move_scores[direction] = -10000
             continue
 
         # Check snake bodies
-        if (next_pos["x"], next_pos["y"]) in snake_positions:
-            # Find which snake we would collide with
-            colliding_snake = "unknown"
-            for snake in game_state["board"]["snakes"]:
-                for segment in snake.get("body", []):
-                    if segment["x"] == next_pos["x"] and segment["y"] == next_pos["y"]:
-                        snake_id = snake.get("id", "unknown")
-                        colliding_snake = snake.get("name", snake_id[:8] if snake_id else "unknown")
-                        break
-                if colliding_snake != "unknown":
-                    break
-            print(f"  {direction}: SNAKE COLLISION at ({next_pos['x']}, {next_pos['y']}) with {colliding_snake}")
+        if next_pos_tuple in snake_positions:
             move_scores[direction] = -10000
             continue
 
         # Check head-to-head collisions
         if not is_head_to_head_safe(next_pos, my_length, opponent_heads):
-            print(f"  {direction}: HEAD-TO-HEAD RISK at ({next_pos['x']}, {next_pos['y']})")
             move_scores[direction] = -10000
             continue
 
@@ -450,130 +482,156 @@ def move(game_state: typing.Dict) -> typing.Dict:
         adjacent_walls = count_adjacent_walls(next_pos, board_width, board_height)
         safe_neighbors = count_safe_neighbors(next_pos, game_state, snake_positions)
 
+        # Reduce trap penalties only in early game when opponents are small
+        trap_multiplier = 0.3 if (game_phase == "early" and opponents_small) else 1.0
+
         # Corner = 2 walls, tight spot = limited safe neighbors
         if adjacent_walls >= 2:
-            print(f"  {direction}: CORNER ({adjacent_walls} walls)")
-            score -= 1500
+            score -= 1500 * trap_multiplier
 
         if safe_neighbors <= 1:
-            # Only 1 or 0 escape routes from this position
-            print(f"  {direction}: TRAP ({safe_neighbors} safe neighbors)")
-            score -= 1000
+            score -= 1000 * trap_multiplier
         elif safe_neighbors == 2:
-            # Penalize but not as severely
-            score -= 200
+            score -= 200 * trap_multiplier
 
         # SPACE CONTROL - flood fill to count reachable spaces
-        avoid_positions = snake_positions.copy()
-        reachable_spaces = flood_fill(next_pos, game_state, avoid_positions)
+        reachable_spaces = flood_fill(next_pos, game_state, snake_positions)
 
         # Must have enough space to survive
         if reachable_spaces < my_length:
             score -= 5000
         else:
-            # Determine if we need to grow
-            length_target = opponent_stats['max_length'] + 2
-            need_length = my_length < length_target
-
             # Reduce space control weight in early game when we need food
-            # This prevents circling in open space instead of eating
             if game_phase == "early" and need_length:
-                score += reachable_spaces * 1  # Minimal weight when growth is priority
+                score += reachable_spaces * 0.5  # Almost no weight - food is everything
             elif game_phase == "early":
-                score += reachable_spaces * 3  # Low weight in early game
+                score += reachable_spaces * 2  # Very low weight in early game
             else:
                 score += reachable_spaces * 10  # Normal weight for late game
 
-        # VORONOI TERRITORY CONTROL - calculate territory if we make this move
-        # Create a simulated game state with our head at next_pos
-        simulated_game_state = {
-            "board": {
-                "width": board_width,
-                "height": board_height,
-                "snakes": []
-            }
-        }
-
-        # Add our snake with new head position
-        simulated_my_body = [next_pos] + game_state["you"]["body"][:-1]  # Move head, remove tail
-        simulated_game_state["board"]["snakes"].append({
-            "id": my_id,
-            "body": simulated_my_body
-        })
-
-        # Add opponent snakes (unchanged for now - simplified simulation)
-        for snake in game_state["board"]["snakes"]:
-            snake_id = snake.get("id", "")
-            if snake_id and snake_id != my_id:
-                simulated_game_state["board"]["snakes"].append(snake)
-
-        # Calculate voronoi after this move
-        simulated_snake_positions = get_all_snake_positions(simulated_game_state)
-        future_voronoi = calculate_voronoi(simulated_game_state, simulated_snake_positions)
-        future_my_territory = future_voronoi.get(my_id, 0)
-
-        # Territory gain/loss
-        territory_change = future_my_territory - my_territory
-
-        # Calculate how much we're cutting off opponents
-        opponent_territory_loss = 0
-        for opp_id, opp_territory in voronoi_territories.items():
-            if opp_id and opp_id != my_id:
-                future_opp_territory = future_voronoi.get(opp_id, 0)
-                opponent_territory_loss += (opp_territory - future_opp_territory)
-
-        # Reward territory gain, especially in late game
+        # VORONOI TERRITORY CONTROL - only in late game (too slow for early game)
         if game_phase in ["late", "1v1"]:
+            # Create a simulated game state with our head at next_pos
+            simulated_game_state = {
+                "board": {
+                    "width": board_width,
+                    "height": board_height,
+                    "snakes": []
+                }
+            }
+
+            # Add our snake with new head position
+            simulated_my_body = [next_pos] + game_state["you"]["body"][:-1]  # Move head, remove tail
+            simulated_game_state["board"]["snakes"].append({
+                "id": my_id,
+                "body": simulated_my_body
+            })
+
+            # Add opponent snakes (unchanged for now - simplified simulation)
+            for snake in game_state["board"]["snakes"]:
+                snake_id = snake.get("id", "")
+                if snake_id and snake_id != my_id:
+                    simulated_game_state["board"]["snakes"].append(snake)
+
+            # Calculate voronoi after this move
+            simulated_snake_positions = get_all_snake_positions(simulated_game_state)
+            future_voronoi = calculate_voronoi(simulated_game_state, simulated_snake_positions)
+            future_my_territory = future_voronoi.get(my_id, 0)
+
+            # Territory gain/loss
+            territory_change = future_my_territory - my_territory
+
+            # Calculate how much we're cutting off opponents
+            opponent_territory_loss = 0
+            for opp_id, opp_territory in voronoi_territories.items():
+                if opp_id and opp_id != my_id:
+                    future_opp_territory = future_voronoi.get(opp_id, 0)
+                    opponent_territory_loss += (opp_territory - future_opp_territory)
+
+            # Reward territory gain
             score += territory_change * 15  # Strong weight in late game
             score += opponent_territory_loss * 10  # Reward cutting off opponents
-        elif game_phase == "early" and not need_length:
-            score += territory_change * 5  # Moderate in early game if already long enough
-            score += opponent_territory_loss * 3
 
-        # Debug log for territory changes
-        if territory_change != 0 or opponent_territory_loss > 0:
-            print(f"  {direction}: Territory change: {territory_change:+d}, Opponent loss: {opponent_territory_loss}")
+        # 1v1 AGGRESSIVE SPACE CUTTING - trap opponent when ahead
+        if game_phase == "1v1" and len(opponent_heads) > 0:
+            opponent = opponent_heads[0]
+
+            if my_length > opponent["length"]:
+                # Calculate opponent's reachable space before our move
+                opponent_reachable_before = flood_fill(opponent["pos"], game_state, snake_positions)
+
+                # Simulate our move
+                simulated_positions = snake_positions.copy()
+                simulated_positions.add(next_pos_tuple)
+
+                # Calculate opponent's reachable space after our move
+                opponent_reachable_after = flood_fill(opponent["pos"], game_state, simulated_positions)
+
+                # Reward moves that cut off opponent space
+                space_reduction = opponent_reachable_before - opponent_reachable_after
+                score += space_reduction * 50
+
+                # CRITICAL: Massive bonus if we can trap them (reduce space below their length)
+                if opponent_reachable_after < opponent["length"]:
+                    score += 5000  # Near-kill move
+                    print(f"  Space cutting: opponent space={opponent_reachable_after}, opponent_length={opponent['length']}")
+
+        # 1v1 TAIL CHASING - our tail is safe when ahead
+        if game_phase == "1v1" and len(opponent_heads) > 0:
+            opponent = opponent_heads[0]
+            my_tail = game_state["you"]["body"][-1]
+            tail_dist = manhattan_distance(next_pos, my_tail)
+
+            if my_length > opponent["length"] + 3:
+                # When significantly ahead, follow our tail - it's guaranteed safe
+                score -= tail_dist * 8
+
+            # Also chase opponent's tail - they can't trap us if we're longer
+            if my_length > opponent["length"]:
+                opponent_body = None
+                for snake in game_state["board"]["snakes"]:
+                    if snake.get("id") == opponent["id"]:
+                        opponent_body = snake.get("body", [])
+                        break
+
+                if opponent_body and len(opponent_body) > 0:
+                    opponent_tail = opponent_body[-1]
+                    opp_tail_dist = manhattan_distance(next_pos, opponent_tail)
+                    score -= opp_tail_dist * 5  # Chase them
 
         # FOOD SEEKING - aggressive early growth, strategic late game
         if len(food) > 0:
-            # Use A* to find actual path distance to each food
-            food_distances = []
-            for f in food:
-                astar_dist = astar_distance(next_pos, f, game_state, snake_positions)
-                if astar_dist is not None:
-                    food_distances.append(astar_dist)
-                else:
-                    # No path to this food, use manhattan as penalty
-                    food_distances.append(manhattan_distance(next_pos, f) + 50)
-
+            # Use Manhattan distance for speed
+            food_distances = [manhattan_distance(next_pos, f) for f in food]
             closest_food_dist = min(food_distances) if food_distances else 999
 
-            # Determine if we need to grow
-            length_target = opponent_stats['max_length'] + 2
-            need_length = my_length < length_target
-
-            # Reduce food seeking if this move is into a trap (let trap penalty dominate)
-            # This prevents suiciding for food in corners
+            # Reduce food seeking if this move is into a trap
             food_weight_multiplier = 1.0
             if adjacent_walls >= 2 or safe_neighbors <= 1:
-                food_weight_multiplier = 0.5  # Reduce food attraction by 50%
+                if game_phase == "early" and opponents_small:
+                    food_weight_multiplier = 0.8  # Only reduce by 20% when safe
+                else:
+                    food_weight_multiplier = 0.5  # Reduce by 50% when risky
 
-            # EARLY GAME: aggressive growth until we have length advantage
+            # EARLY GAME: hyper-aggressive growth until we have length advantage
             if game_phase == "early":
                 if need_length:
-                    # Very aggressive food seeking when behind in length
-                    score -= closest_food_dist * 100 * food_weight_multiplier
-                    score += (100 - my_health) * 8
-                    # Extra bonus for being shorter than opponents
+                    # MAXIMUM food seeking when behind in length - grow fast!
+                    score -= closest_food_dist * 200 * food_weight_multiplier
+                    score += (100 - my_health) * 15
+                    # Extra massive bonus for being shorter than opponents
                     if my_length <= opponent_stats['avg_length']:
-                        score -= closest_food_dist * 60 * food_weight_multiplier
+                        score -= closest_food_dist * 120 * food_weight_multiplier
+                    # Even more if significantly behind
+                    if my_length < opponent_stats['max_length'] - 2:
+                        score -= closest_food_dist * 80 * food_weight_multiplier
                 elif my_health < 50:
                     # Have length advantage but need health
-                    score -= closest_food_dist * 80 * food_weight_multiplier
-                    score += (100 - my_health) * 5
+                    score -= closest_food_dist * 100 * food_weight_multiplier
+                    score += (100 - my_health) * 8
                 else:
-                    # Have length advantage and good health - moderate food seeking
-                    score -= closest_food_dist * 30 * food_weight_multiplier
+                    # Have length advantage and good health - still seek food
+                    score -= closest_food_dist * 50 * food_weight_multiplier
 
             # LATE GAME: only seek food when necessary
             elif game_phase in ["late", "1v1"]:
@@ -587,6 +645,24 @@ def move(game_state: typing.Dict) -> typing.Dict:
                 elif my_health > 70:
                     # Healthy - avoid food to focus on space control and aggression
                     score += closest_food_dist * 3
+
+                # 1v1 FOOD DENIAL: control food when ahead
+                if game_phase == "1v1" and len(opponent_heads) > 0:
+                    opponent = opponent_heads[0]
+
+                    if my_length > opponent["length"]:
+                        # For each food, check if opponent is closer
+                        for food_pos in food:
+                            my_dist_to_food = manhattan_distance(next_pos, food_pos)
+                            opp_dist_to_food = manhattan_distance(opponent["pos"], food_pos)
+
+                            # If opponent is closer to this food, try to block it
+                            if opp_dist_to_food < my_dist_to_food:
+                                score -= my_dist_to_food * 25
+
+                            # If we're closer and healthy, take it to maintain advantage
+                            elif my_dist_to_food < opp_dist_to_food and my_health < 60:
+                                score -= my_dist_to_food * 15
 
         # AGGRESSION - context-dependent based on advantages
         for opponent in opponent_heads:
@@ -616,6 +692,35 @@ def move(game_state: typing.Dict) -> typing.Dict:
                     if opponent_dist < 3:
                         score += opponent_dist * 15
 
+                # 1v1 FUTURE HEAD-TO-HEAD CONTROL: predict and block opponent moves
+                if game_phase == "1v1":
+                    # Predict opponent's possible moves
+                    opponent_possible_moves = predict_opponent_moves(
+                        opponent["pos"], opponent["length"], game_state, snake_positions
+                    )
+
+                    # Control spaces opponent wants to move to
+                    for opp_dir, opp_move_data in opponent_possible_moves.items():
+                        opp_next_pos = opp_move_data["pos"]
+                        dist_to_their_move = manhattan_distance(next_pos, opp_next_pos)
+
+                        if my_length > opponent["length"]:
+                            # Get CLOSER to their options to intimidate/block
+                            score -= dist_to_their_move * 30
+                        else:
+                            # Stay AWAY from their options
+                            score += dist_to_their_move * 20
+
+                    # Reward moves that limit opponent's good options
+                    bad_options_count = sum(1 for move_data in opponent_possible_moves.values()
+                                          if move_data["spaces"] < opponent["length"])
+                    total_options = len(opponent_possible_moves)
+
+                    if total_options > 0:
+                        # If most of their moves are bad, we're in a great position
+                        bad_ratio = bad_options_count / total_options
+                        score += bad_ratio * 500
+
             # Early game: mild aggression if we have strong territory advantage
             elif game_phase == "early":
                 # If we have huge territory advantage, push them a bit
@@ -626,13 +731,20 @@ def move(game_state: typing.Dict) -> typing.Dict:
                 if opponent_dist < 4 and territory_advantage:
                     score -= opponent_dist * 1
 
-        # CENTER CONTROL - early game (lower priority than food)
-        if game_phase == "early" and my_health > 60:
-            # Only care about center when healthy (food is more important)
-            center_x = board_width // 2
-            center_y = board_height // 2
-            center_dist = abs(next_pos["x"] - center_x) + abs(next_pos["y"] - center_y)
-            score -= center_dist * 1
+        # CENTER CONTROL - territory dominance
+        center_x = board_width // 2
+        center_y = board_height // 2
+        center_dist = abs(next_pos["x"] - center_x) + abs(next_pos["y"] - center_y)
+
+        if game_phase == "early":
+            # Early game: moderate center preference (food still priority)
+            score -= center_dist * 5
+        elif game_phase == "late":
+            # Late game: strong center control for territory
+            score -= center_dist * 10
+        elif game_phase == "1v1":
+            # 1v1: maximum center control
+            score -= center_dist * 15
 
         # PREFER OPEN SPACE - bonus for moves with more escape routes
         # But only apply this when not aggressively seeking food
@@ -641,56 +753,13 @@ def move(game_state: typing.Dict) -> typing.Dict:
 
         move_scores[direction] = score
 
-    # Select best move - prioritize avoiding walls absolutely
-    definitely_safe_moves = []
-    for direction in directions:
-        next_pos = get_next_position(my_head, direction)
-        if not is_out_of_bounds(next_pos, board_width, board_height):
-            definitely_safe_moves.append(direction)
+    # Get moves that won't immediately kill us (score > -10000)
+    safe_moves = [d for d in directions if move_scores[d] > -10000]
 
-    print(f"  Move scores: {move_scores}")
-    print(f"  Definitely not out of bounds: {definitely_safe_moves}")
+    # Choose best available move
+    next_move = max(safe_moves, key=lambda m: move_scores[m]) if safe_moves else max(directions, key=lambda m: move_scores[m])
 
-    # Filter to moves that are both in-bounds AND have good scores
-    safe_moves = [move for move in definitely_safe_moves if move_scores[move] > -10000]
-
-    print(f"  Safe moves (in bounds + good score): {safe_moves}")
-
-    if len(safe_moves) == 0:
-        # Desperate: choose best in-bounds move even if it hits a snake
-        if len(definitely_safe_moves) > 0:
-            print(f"MOVE {game_state['turn']}: Desperate! Choosing best in-bounds move")
-            next_move = max(definitely_safe_moves, key=lambda m: move_scores[m])
-        else:
-            # Completely trapped - all moves are out of bounds
-            # This should never happen, but pick the least-bad out-of-bounds move
-            print(f"MOVE {game_state['turn']}: ALL MOVES OUT OF BOUNDS! Picking least bad")
-            next_move = max(move_scores.keys(), key=lambda m: move_scores[m])
-    else:
-        # Choose move with highest score from safe moves
-        next_move = max(safe_moves, key=lambda m: move_scores[m])
-
-    # Final verification before returning
-    final_pos = get_next_position(my_head, next_move)
-    if is_out_of_bounds(final_pos, board_width, board_height):
-        print(f"CRITICAL WARNING: Selected move {next_move} is OUT OF BOUNDS! Head: ({my_head['x']}, {my_head['y']}), Next: ({final_pos['x']}, {final_pos['y']}), Board: {board_width}x{board_height}")
-        print(f"  This should never happen! Definitely safe moves: {definitely_safe_moves}")
-        print(f"  All move scores: {move_scores}")
-
-        # Emergency override: pick first definitely safe move or random if none
-        if len(definitely_safe_moves) > 0:
-            next_move = definitely_safe_moves[0]
-            print(f"  EMERGENCY OVERRIDE: Choosing {next_move} instead")
-        else:
-            # Truly desperate - try all directions and pick first one that's in bounds
-            for emergency_direction in ["up", "down", "left", "right"]:
-                emergency_pos = get_next_position(my_head, emergency_direction)
-                if not is_out_of_bounds(emergency_pos, board_width, board_height):
-                    next_move = emergency_direction
-                    print(f"  EMERGENCY OVERRIDE: Choosing {next_move} as last resort")
-                    break
-
-    print(f"MOVE {game_state['turn']}: {next_move} (phase: {game_phase}, health: {my_health}, score: {move_scores.get(next_move, 'N/A')})")
+    print(f"MOVE {game_state['turn']}: {next_move}")
     return {"move": next_move}
 
 
